@@ -40,3 +40,18 @@ URLS
 10. UPENN: https://www.cancerimagingarchive.net/collection/upenn-gbm/
 11. UCSF: https://www.cancerimagingarchive.net/collection/ucsf-pdgm/
 12. REMBRANDT: https://www.cancerimagingarchive.net/collection/rembrandt/
+
+
+
+## Runs
+
+### MAE
+full base: batch 32, mask ratio 0.2
+full : batch 12, mask ratio 0.3
+full small: batch 32 mask ratio 0.3
+full small public: batch 12 mask ratio 0.3
+
+### DINO
+
+full ogevaert: batch 16
+full public: batch 4
