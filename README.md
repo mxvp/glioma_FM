@@ -51,7 +51,9 @@ full : batch 12, mask ratio 0.3
 full small: batch 32 mask ratio 0.3
 full small public: batch 12 mask ratio 0.3
 
-### DINO
+bbox: regular config, batch 12 , masking ratio 0.3, lr 1e4
 
+### DINO
+bbox public: batch 4
 full ogevaert: batch 16
 full public: batch 4

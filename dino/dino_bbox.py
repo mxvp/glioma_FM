@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import os
-import sys
 import argparse
 import torch
 import torch.nn as nn
@@ -10,13 +9,12 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoImageProcessor, AutoModel
 from copy import deepcopy
 from tqdm import tqdm
-import random
 import numpy as np
 import nibabel as nib
 from glob import glob
-import torchvision.utils as vutils
-from PIL import Image
 import warnings
+from skimage.transform import resize
+import json
 
 # ========== Hardcoded dataset paths ==========
 DATASET_PATHS = {
@@ -84,49 +82,40 @@ def get_dataset_pairs(dataset_names):
 
 # ========== Configuration ==========
 DINO_MODEL_NAME = "facebook/dinov2-base"
-OUTPUT_EMBEDDINGS = "/oak/stanford/groups/ogevaert/maxvpuyv/projects/brain/output_embeddings"
-DEBUG_SAVE_DIR = "/oak/stanford/groups/ogevaert/maxvpuyv/projects/brain/debug_slices"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-os.makedirs(DEBUG_SAVE_DIR, exist_ok=True)
-
-# ========== Utility: Bounding box crop ==========
-def crop_to_fixed_tumor_box(image, label, target_size=(128, 128, 64)):
-    coords = np.argwhere(label > 0)
-    if coords.shape[0] == 0:
-        return None, None
-
-    center = np.mean(coords, axis=0).astype(int)
-    half_size = np.array(target_size) // 2
-    
-    start = np.maximum(center - half_size, 0)
-    end = start + target_size
-
-    for i in range(3):
-        if end[i] > image.shape[i]:
-            end[i] = image.shape[i]
-            start[i] = max(0, end[i] - target_size[i])
-
-    img_cropped = image[start[0]:end[0], start[1]:end[1], start[2]:end[2]]
-    return img_cropped, (start, end)
 
 # ========== Dataset and Augmentations ==========
 class MRISliceDataset(Dataset):
-    def __init__(self, nii_paths, label_paths, target_size=(128, 128, 64)):
+    def __init__(self, nii_paths, label_paths, crop_size=(80, 96), margin=10):
         self.pairs = list(zip(nii_paths, label_paths))
         self.slice_data = []
+        self.crop_size = crop_size
+        self.margin = margin if isinstance(margin, (list, tuple)) else [margin, margin]
 
         for img_path, lbl_path in self.pairs:
             img = nib.load(img_path).get_fdata().astype(np.float32)
-            lbl = nib.load(lbl_path).get_fdata().astype(np.uint8)
-
+            mask = nib.load(lbl_path).get_fdata().astype(np.uint8)
             img = img / (np.max(img) + 1e-8)
-            cropped_img, box = crop_to_fixed_tumor_box(img, lbl, target_size)
-            if cropped_img is None:
-                continue
 
-            for i in range(cropped_img.shape[2]):
-                self.slice_data.append((cropped_img[:, :, i], os.path.basename(img_path).replace(".nii.gz", f"_z{i}.npy")))
+            # For each slice, crop to tumor bbox + margin, then resize
+            for i in range(img.shape[2]):
+                mask_slice = mask[:, :, i]
+                if np.sum(mask_slice) == 0:
+                    continue  # skip slices without tumor
+
+                coords = np.array(np.where(mask_slice > 0))
+                ymin, xmin = coords.min(axis=1)
+                ymax, xmax = coords.max(axis=1)
+                # Add margin, clip to image bounds
+                ymin = max(0, ymin - self.margin[0])
+                ymax = min(img.shape[0] - 1, ymax + self.margin[0])
+                xmin = max(0, xmin - self.margin[1])
+                xmax = min(img.shape[1] - 1, xmax + self.margin[1])
+
+                img_crop = img[ymin:ymax+1, xmin:xmax+1, i]
+                # Resize to crop_size (height, width)
+                img_crop = resize(img_crop, self.crop_size, order=1, mode='constant', anti_aliasing=True)
+                self.slice_data.append((img_crop, os.path.basename(img_path).replace(".nii.gz", f"_z{i}.npy")))
 
         self.aug1 = T.Compose([
             T.ToPILImage(),
@@ -136,7 +125,6 @@ class MRISliceDataset(Dataset):
             T.Grayscale(num_output_channels=3),
             T.ToTensor()
         ])
-
         self.aug2 = deepcopy(self.aug1)
 
     def __len__(self):
@@ -148,12 +136,6 @@ class MRISliceDataset(Dataset):
 
         if np.std(slice_2d) < 1e-5:
             return self.__getitem__((idx + 1) % len(self))
-
-        if random.random() < 0.01:
-            img = Image.fromarray(slice_2d)
-            img.save(os.path.join(DEBUG_SAVE_DIR, fname.replace('.npy', '_raw.png')))
-            vutils.save_image(self.aug1(slice_2d), os.path.join(DEBUG_SAVE_DIR, fname.replace('.npy', '_aug1.png')))
-            vutils.save_image(self.aug2(slice_2d), os.path.join(DEBUG_SAVE_DIR, fname.replace('.npy', '_aug2.png')))
 
         return self.aug1(slice_2d), self.aug2(slice_2d), fname
 
@@ -205,12 +187,13 @@ class ProjectionHead(nn.Module):
 
 # ========== Load Models ==========
 def build_dino_vit():
-    processor = AutoImageProcessor.from_pretrained(DINO_MODEL_NAME)
-    vit = AutoModel.from_pretrained(DINO_MODEL_NAME)
+    processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
+    vit = AutoModel.from_pretrained("facebook/dinov2-base")
     return vit.to(DEVICE), processor
 
 # ========== Training ==========
-def train(dataset_names):
+
+def train(dataset_names, epochs, batch_size, save_ckpt_steps, num_workers, save_dir, crop_size, margin):
     vit, processor = build_dino_vit()
     teacher = deepcopy(vit).eval()
     student_head = ProjectionHead(vit.config.hidden_size).to(DEVICE)
@@ -220,14 +203,22 @@ def train(dataset_names):
     opt = torch.optim.AdamW(student_head.parameters(), lr=1e-5, weight_decay=1e-2)
 
     nii_paths, label_paths = get_dataset_pairs(dataset_names)
-    dataset = MRISliceDataset(nii_paths, label_paths)
-    loader = DataLoader(dataset, batch_size=16, shuffle=True, num_workers=4)
+    dataset = MRISliceDataset(nii_paths, label_paths, crop_size=crop_size, margin=margin)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
-    for epoch in range(20):
+    checkpoints_dir = os.path.join(save_dir, "checkpoints")
+    os.makedirs(checkpoints_dir, exist_ok=True)
+    loss_log = []
+
+    # Add loss log path
+    loss_log_path = os.path.join(save_dir, "loss_log.json")
+
+    global_step = 0
+    for epoch in range(epochs):
         total_loss = 0
         running_loss = []
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}")
-        for view1, view2, fnames in pbar:
+        for i, (view1, view2, fnames) in enumerate(pbar):
             view1 = view1.to(DEVICE)
             view2 = view2.to(DEVICE)
 
@@ -240,11 +231,6 @@ def train(dataset_names):
 
             if torch.isnan(student_out).any() or torch.isnan(teacher_out).any():
                 print("NaNs detected in embeddings!")
-                print("  teacher_out max:", teacher_out.max().item(), "min:", teacher_out.min().item(), "std:", teacher_out.std().item())
-                print("  student_out max:", student_out.max().item(), "min:", student_out.min().item(), "std:", student_out.std().item())
-                for i, fname in enumerate(fnames):
-                    save_path = os.path.join(DEBUG_SAVE_DIR, f"{fname.replace('.npy', '')}_nan_slice_{epoch}.png")
-                    vutils.save_image(view1[i].cpu(), save_path)
                 continue
 
             loss = loss_fn(student_out, teacher_out)
@@ -267,13 +253,55 @@ def train(dataset_names):
 
             pbar.set_postfix({"Rolling loss": f"{avg_loss:.4f}"})
 
-        print(f"Epoch {epoch+1} - Loss: {total_loss / len(loader):.4f}")
+            global_step += 1
 
-    torch.save(student_head.state_dict(), "student_head.pth")
-    print("Finished training. Projection head saved.")
+            # Save checkpoint every save_ckpt_steps steps
+            if save_ckpt_steps > 0 and global_step % save_ckpt_steps == 0:
+                ckpt = {
+                    "epoch": epoch + 1,
+                    "step": global_step,
+                    "backbone": vit.state_dict(),
+                    "head": student_head.state_dict(),
+                    "optimizer": opt.state_dict(),
+                    "loss_log": loss_log,
+                }
+                ckpt_path = os.path.join(checkpoints_dir, f"checkpoint_step{global_step}_epoch{epoch+1}.pt")
+                torch.save(ckpt, ckpt_path)
+                print(f"Checkpoint saved: {ckpt_path}")
+
+        mean_loss = total_loss / len(loader)
+        print(f"Epoch {epoch+1} - Loss: {mean_loss:.4f}")
+        loss_log.append({"epoch": epoch+1, "loss": mean_loss})
+
+        # Write loss log after each epoch
+        with open(loss_log_path, "w") as f:
+            json.dump(loss_log, f, indent=2)
+
+    # Save final checkpoint at the end of training
+    ckpt = {
+        "epoch": epochs,
+        "step": global_step,
+        "backbone": vit.state_dict(),
+        "head": student_head.state_dict(),
+        "optimizer": opt.state_dict(),
+        "loss_log": loss_log,
+    }
+    ckpt_path = os.path.join(checkpoints_dir, f"checkpoint_final.pt")
+    torch.save(ckpt, ckpt_path)
+    print(f"Final checkpoint saved: {ckpt_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", nargs='+', required=True, choices=list(DATASET_PATHS.keys()))
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--save-ckpt-steps", type=int, default=1000, help="Save checkpoint every N steps")
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--save-dir", type=str, default="dino_results", help="Directory to save results (checkpoints)")
+    parser.add_argument("--crop-size", nargs=2, type=int, default=[80, 96], help="Crop size for tumor bbox (height width)")
+    parser.add_argument("--margin", nargs=2, type=int, default=[10, 10], help="Margin to add to bbox (height width)")
     args = parser.parse_args()
-    train(args.datasets)
+    train(
+        args.datasets, args.epochs, args.batch_size, args.save_ckpt_steps,
+        args.num_workers, args.save_dir, tuple(args.crop_size), list(args.margin)
+    )
